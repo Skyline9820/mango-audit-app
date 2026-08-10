@@ -2,6 +2,12 @@ name: Deploy
 
 # Se dispara SOLO cuando hay un push directo o un merge (de un PR) hacia
 # las ramas develop o main. Cada rama va a un ambiente distinto.
+#
+# NOTA: este workflow está adaptado a hosting SOLO CON FTP (ej. Neubox,
+# plan "Push It"), donde NO hay acceso SSH ni terminal remota. Por eso
+# el mecanismo de rollback es distinto al de un servidor con SSH: en
+# vez de mover un symlink en el servidor, si el health check falla,
+# se vuelve a subir por FTP la última versión que sí funcionó.
 on:
   push:
     branches:
@@ -12,30 +18,32 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # "environment" activa las reglas de protección que configures en
-    # GitHub (Settings > Environments): por ejemplo, exigir aprobación
-    # manual antes de desplegar a "production".
+    # Necesario para poder crear/mover el tag "*-stable" (git push) desde
+    # el propio workflow.
+    permissions:
+      contents: write
+
     environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
 
-    # --- Manejo de conflictos de despliegue ---
-    # Si llegan dos despliegues casi al mismo tiempo a la MISMA rama
-    # (por ejemplo dos merges seguidos), este bloque asegura que el
-    # segundo espere a que el primero termine, en vez de correr en
-    # paralelo y dejar el servidor en un estado inconsistente.
+    # Evita que dos despliegues a la misma rama corran al mismo tiempo
+    # y se pisen subiendo archivos por FTP en paralelo.
     concurrency:
       group: deploy-${{ github.ref_name }}
       cancel-in-progress: false
 
     env:
-      # Carpeta base en el servidor para este ambiente. Dentro de ella
-      # se maneja una estructura de "releases" versionadas + un symlink
-      # "current" que apunta a la versión activa (para poder revertir).
-      BASE_PATH: ${{ github.ref_name == 'main' && '/var/www/produccion' || '/var/www/staging' }}
+      FTP_TARGET_DIR: '/auditorias.mangobc.com/'
       HEALTHCHECK_URL: ${{ github.ref_name == 'main' && secrets.HEALTHCHECK_URL_PROD || secrets.HEALTHCHECK_URL_STAGING }}
+      # Un tag de Git que siempre apunta al último commit que SÍ pasó
+      # el health check. Sirve como "la última versión buena conocida"
+      # para poder volver a subirla si el nuevo despliegue falla.
+      STABLE_TAG: ${{ github.ref_name == 'main' && 'production-stable' || 'staging-stable' }}
 
     steps:
       - name: Descargar código
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # trae todo el historial, se necesita para poder saltar a STABLE_TAG si hace falta
 
       - name: Configurar PHP
         uses: shivammathur/setup-php@v2
@@ -45,69 +53,84 @@ jobs:
       - name: Instalar dependencias (solo producción)
         run: composer install --no-dev --optimize-autoloader --prefer-dist --no-progress
 
-      # Copia el código a una carpeta de release NUEVA y separada
-      # (releases/<sha-del-commit>), en vez de sobrescribir directamente
-      # la carpeta que está sirviendo el tráfico. Así la versión anterior
-      # queda intacta por si hay que regresar a ella.
-      - name: Copiar código a carpeta de release nueva
-        uses: easingthemes/ssh-deploy@main
+      # Sube el código actual por FTP a la carpeta del ambiente
+      # correspondiente. No hay "carpeta de release" separada porque
+      # el hosting de solo-FTP no permite manejarlo con symlinks.
+      - name: Subir por FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
-          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          REMOTE_HOST: ${{ secrets.DEPLOY_HOST }}
-          REMOTE_USER: ${{ secrets.DEPLOY_USER }}
-          TARGET: ${{ env.BASE_PATH }}/releases/${{ github.sha }}
-          ARGS: '-avz --delete'
-          EXCLUDE: '/.git/, /.github/, /tests/'
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          local-dir: ./
+          server-dir: ${{ env.FTP_TARGET_DIR }}
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/tests/**
+            **/.env.example
 
-      # Activa la nueva release (mueve el symlink "current"), espera
-      # unos segundos, y verifica con un curl que la app responda bien.
-      # Si el health check FALLA, regresa el symlink a la release
-      # anterior automáticamente (rollback) y marca el workflow en rojo.
-      - name: Activar release, verificar salud y hacer rollback si falla
-        uses: appleboy/ssh-action@v1
+      - name: Esperar a que el hosting recargue los archivos
+        run: sleep 5
+
+      # Verifica que la app responda bien tras el despliegue. Si no,
+      # el paso siguiente hace el rollback.
+      - name: Verificar salud de la app
+        id: healthcheck
+        run: |
+          if curl -fsS --max-time 10 "${{ env.HEALTHCHECK_URL }}" > /dev/null; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Si el health check pasó, este commit se vuelve la nueva
+      # "versión estable" a la que regresar en el futuro si algo falla.
+      - name: Marcar este commit como la versión estable
+        if: steps.healthcheck.outputs.ok == 'true'
+        run: |
+          git tag -f ${{ env.STABLE_TAG }}
+          git push origin ${{ env.STABLE_TAG }} --force
+
+      # Si el health check falló: regresa el código al último commit
+      # estable conocido y lo vuelve a subir por FTP (rollback manual
+      # vía re-despliegue, que es lo único posible sin acceso SSH).
+      - name: Rollback — volver a subir la última versión estable
+        if: steps.healthcheck.outputs.ok == 'false'
+        run: |
+          echo "::error::Health check falló para ${{ github.sha }}. Revirtiendo a ${{ env.STABLE_TAG }}."
+          git fetch origin tag ${{ env.STABLE_TAG }} || echo "No existe una versión estable previa registrada aún."
+          if git rev-parse "${{ env.STABLE_TAG }}" >/dev/null 2>&1; then
+            git checkout "${{ env.STABLE_TAG }}"
+            composer install --no-dev --optimize-autoloader --prefer-dist --no-progress
+          else
+            echo "No hay versión estable anterior a la cual volver — se deja el despliegue fallido para revisión manual."
+          fi
+
+      - name: Volver a subir la versión estable por FTP (si hubo rollback)
+        if: steps.healthcheck.outputs.ok == 'false'
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            set -e
-            APP_PATH="${{ env.BASE_PATH }}"
-            NEW_RELEASE="$APP_PATH/releases/${{ github.sha }}"
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          local-dir: ./
+          server-dir: ${{ env.FTP_TARGET_DIR }}
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/tests/**
+            **/.env.example
 
-            # Guarda a qué release apuntaba "current" ANTES de moverlo,
-            # para poder regresar a ella si algo sale mal.
-            PREVIOUS_RELEASE=$(readlink "$APP_PATH/current" || echo "")
+      - name: Marcar el workflow como fallido (para que se note en GitHub)
+        if: steps.healthcheck.outputs.ok == 'false'
+        run: exit 1
 
-            # Enlaza el .env compartido (no viaja con cada release) y
-            # activa la nueva versión.
-            ln -sfn "$APP_PATH/shared/.env" "$NEW_RELEASE/.env"
-            ln -sfn "$NEW_RELEASE" "$APP_PATH/current"
-
-            # Le da un momento al servidor (php-fpm/nginx) para recargar.
-            sleep 3
-
-            if curl -fsS --max-time 10 "${{ env.HEALTHCHECK_URL }}" > /dev/null; then
-              echo "Health check OK. Despliegue exitoso: ${{ github.sha }}"
-              # Limpieza: conserva solo las últimas 5 releases en el servidor.
-              cd "$APP_PATH/releases" && ls -dt */ | tail -n +6 | xargs -r rm -rf
-            else
-              echo "Health check FALLÓ para ${{ github.sha }}."
-              if [ -n "$PREVIOUS_RELEASE" ]; then
-                echo "Revirtiendo automáticamente a la release anterior: $PREVIOUS_RELEASE"
-                ln -sfn "$PREVIOUS_RELEASE" "$APP_PATH/current"
-              else
-                echo "No había una release anterior a la cual regresar."
-              fi
-              exit 1
-            fi
-
-      # Este paso solo corre si algún paso anterior falló (el health
-      # check, la conexión SSH, etc.). Aquí es donde se conecta la
-      # notificación real: Slack, correo, Teams, etc.
+      # Aquí se conecta la notificación real: Slack, correo, Teams, etc.
       - name: Notificar despliegue fallido (y revertido)
         if: failure()
         run: |
-          echo "::error::El despliegue a ${{ github.ref_name }} falló y fue revertido a la versión anterior. Revisar el log de este workflow."
+          echo "::error::El despliegue a ${{ github.ref_name }} falló y se revirtió a la última versión estable."
           # Ejemplo con un webhook de Slack (requiere el secreto SLACK_WEBHOOK_URL):
           # curl -X POST -H 'Content-type: application/json' \
           #   --data "{\"text\":\"Deploy a ${{ github.ref_name }} FALLÓ y se revirtió. Commit: ${{ github.sha }}\"}" \
