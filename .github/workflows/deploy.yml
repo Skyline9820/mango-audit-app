@@ -1,0 +1,114 @@
+name: Deploy
+
+# Se dispara SOLO cuando hay un push directo o un merge (de un PR) hacia
+# las ramas develop o main. Cada rama va a un ambiente distinto.
+on:
+  push:
+    branches:
+      - develop   # -> ambiente de staging/pruebas
+      - main      # -> ambiente de producción
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    # "environment" activa las reglas de protección que configures en
+    # GitHub (Settings > Environments): por ejemplo, exigir aprobación
+    # manual antes de desplegar a "production".
+    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+
+    # --- Manejo de conflictos de despliegue ---
+    # Si llegan dos despliegues casi al mismo tiempo a la MISMA rama
+    # (por ejemplo dos merges seguidos), este bloque asegura que el
+    # segundo espere a que el primero termine, en vez de correr en
+    # paralelo y dejar el servidor en un estado inconsistente.
+    concurrency:
+      group: deploy-${{ github.ref_name }}
+      cancel-in-progress: false
+
+    env:
+      # Carpeta base en el servidor para este ambiente. Dentro de ella
+      # se maneja una estructura de "releases" versionadas + un symlink
+      # "current" que apunta a la versión activa (para poder revertir).
+      BASE_PATH: ${{ github.ref_name == 'main' && '/var/www/produccion' || '/var/www/staging' }}
+      HEALTHCHECK_URL: ${{ github.ref_name == 'main' && secrets.HEALTHCHECK_URL_PROD || secrets.HEALTHCHECK_URL_STAGING }}
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+
+      - name: Instalar dependencias (solo producción)
+        run: composer install --no-dev --optimize-autoloader --prefer-dist --no-progress
+
+      # Copia el código a una carpeta de release NUEVA y separada
+      # (releases/<sha-del-commit>), en vez de sobrescribir directamente
+      # la carpeta que está sirviendo el tráfico. Así la versión anterior
+      # queda intacta por si hay que regresar a ella.
+      - name: Copiar código a carpeta de release nueva
+        uses: easingthemes/ssh-deploy@main
+        with:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          REMOTE_HOST: ${{ secrets.DEPLOY_HOST }}
+          REMOTE_USER: ${{ secrets.DEPLOY_USER }}
+          TARGET: ${{ env.BASE_PATH }}/releases/${{ github.sha }}
+          ARGS: '-avz --delete'
+          EXCLUDE: '/.git/, /.github/, /tests/'
+
+      # Activa la nueva release (mueve el symlink "current"), espera
+      # unos segundos, y verifica con un curl que la app responda bien.
+      # Si el health check FALLA, regresa el symlink a la release
+      # anterior automáticamente (rollback) y marca el workflow en rojo.
+      - name: Activar release, verificar salud y hacer rollback si falla
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            APP_PATH="${{ env.BASE_PATH }}"
+            NEW_RELEASE="$APP_PATH/releases/${{ github.sha }}"
+
+            # Guarda a qué release apuntaba "current" ANTES de moverlo,
+            # para poder regresar a ella si algo sale mal.
+            PREVIOUS_RELEASE=$(readlink "$APP_PATH/current" || echo "")
+
+            # Enlaza el .env compartido (no viaja con cada release) y
+            # activa la nueva versión.
+            ln -sfn "$APP_PATH/shared/.env" "$NEW_RELEASE/.env"
+            ln -sfn "$NEW_RELEASE" "$APP_PATH/current"
+
+            # Le da un momento al servidor (php-fpm/nginx) para recargar.
+            sleep 3
+
+            if curl -fsS --max-time 10 "${{ env.HEALTHCHECK_URL }}" > /dev/null; then
+              echo "Health check OK. Despliegue exitoso: ${{ github.sha }}"
+              # Limpieza: conserva solo las últimas 5 releases en el servidor.
+              cd "$APP_PATH/releases" && ls -dt */ | tail -n +6 | xargs -r rm -rf
+            else
+              echo "Health check FALLÓ para ${{ github.sha }}."
+              if [ -n "$PREVIOUS_RELEASE" ]; then
+                echo "Revirtiendo automáticamente a la release anterior: $PREVIOUS_RELEASE"
+                ln -sfn "$PREVIOUS_RELEASE" "$APP_PATH/current"
+              else
+                echo "No había una release anterior a la cual regresar."
+              fi
+              exit 1
+            fi
+
+      # Este paso solo corre si algún paso anterior falló (el health
+      # check, la conexión SSH, etc.). Aquí es donde se conecta la
+      # notificación real: Slack, correo, Teams, etc.
+      - name: Notificar despliegue fallido (y revertido)
+        if: failure()
+        run: |
+          echo "::error::El despliegue a ${{ github.ref_name }} falló y fue revertido a la versión anterior. Revisar el log de este workflow."
+          # Ejemplo con un webhook de Slack (requiere el secreto SLACK_WEBHOOK_URL):
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data "{\"text\":\"Deploy a ${{ github.ref_name }} FALLÓ y se revirtió. Commit: ${{ github.sha }}\"}" \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}

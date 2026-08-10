@@ -1,0 +1,40 @@
+name: CI
+
+# Se ejecuta en CUALQUIER rama al hacer push, y en cualquier Pull Request
+# hacia develop o main. Esto es solo "build + test", nunca despliega nada.
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - develop
+      - main
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, pdo_mysql
+
+      - name: Instalar dependencias (Composer)
+        run: composer install --prefer-dist --no-progress
+
+      - name: Verificar sintaxis de todos los archivos PHP
+        run: find src public config -name "*.php" -print0 | xargs -0 -n1 php -l
+
+      - name: Ejecutar pruebas (PHPUnit)
+        run: |
+          if [ -f vendor/bin/phpunit ]; then
+            vendor/bin/phpunit --colors=always
+          else
+            echo "No hay PHPUnit configurado todavía, se omite."
+          fi
