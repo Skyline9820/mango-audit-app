@@ -32,7 +32,7 @@ jobs:
       cancel-in-progress: false
 
     env:
-      FTP_TARGET_DIR: '/auditorias.mangobc.com/'
+      FTP_TARGET_DIR: '/'
       HEALTHCHECK_URL: ${{ github.ref_name == 'main' && secrets.HEALTHCHECK_URL_PROD || secrets.HEALTHCHECK_URL_STAGING }}
       # Un tag de Git que siempre apunta al último commit que SÍ pasó
       # el health check. Sirve como "la última versión buena conocida"
