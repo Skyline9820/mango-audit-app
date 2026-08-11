@@ -3,15 +3,15 @@
 namespace App\Controllers;
 
 use App\Models\User;
-use Odan\Session\SessionInterface;
+use App\Session;
 use Psr\Http\Message\ResponseInterface as Response;
 use Psr\Http\Message\ServerRequestInterface as Request;
 
 class UserController
 {
-    private SessionInterface $session;
+    private Session $session;
 
-    public function __construct(SessionInterface $session)
+    public function __construct(Session $session)
     {
         $this->session = $session;
     }
@@ -39,7 +39,6 @@ class UserController
             return $response->withHeader('Content-Type', 'application/json')->withStatus(401);
         }
 
-        // Guarda datos en la sesión, igual que session['user_id'] = ... en Flask
         $this->session->set('user_id', $user->id);
         $this->session->set('user_name', $user->name);
 

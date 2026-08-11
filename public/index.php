@@ -1,8 +1,7 @@
 <?php
 
+use App\Session;
 use DI\Container;
-use Odan\Session\PhpSession;
-use Odan\Session\SessionInterface;
 use Slim\Factory\AppFactory;
 
 require __DIR__ . '/../vendor/autoload.php';
@@ -19,17 +18,17 @@ $capsuleFactory();
 
 // Contenedor de dependencias simple (para inyectar el manejador de sesión)
 $container = new Container();
-$container->set(SessionInterface::class, function () {
-    return new PhpSession();
+$container->set(Session::class, function () {
+    return new Session();
 });
 
 AppFactory::setContainer($container);
 $app = AppFactory::create();
 
-// Middleware de sesión: arranca session_start() de forma segura en cada request
+// Middleware de sesión: arranca la sesión de forma segura en cada request
 $app->add(function ($request, $handler) use ($container) {
-    /** @var SessionInterface $session */
-    $session = $container->get(SessionInterface::class);
+    /** @var Session $session */
+    $session = $container->get(Session::class);
     $session->start();
     $response = $handler->handle($request);
     $session->save();

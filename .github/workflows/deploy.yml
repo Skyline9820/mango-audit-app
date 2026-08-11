@@ -32,6 +32,8 @@ jobs:
       cancel-in-progress: false
 
     env:
+      # Carpeta remota dentro del hosting de Neubox para cada ambiente
+      # (ajusta estas rutas a como esté organizado el FTP real).
       FTP_TARGET_DIR: '/'
       HEALTHCHECK_URL: ${{ github.ref_name == 'main' && secrets.HEALTHCHECK_URL_PROD || secrets.HEALTHCHECK_URL_STAGING }}
       # Un tag de Git que siempre apunta al último commit que SÍ pasó
@@ -48,7 +50,7 @@ jobs:
       - name: Configurar PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.2'
+          php-version: '7.4'
 
       - name: Instalar dependencias (solo producción)
         run: composer install --no-dev --optimize-autoloader --prefer-dist --no-progress
